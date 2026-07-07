@@ -1,0 +1,28 @@
+# Dataset
+VOCdevkit/
+dataset/
+
+# Model weights
+*.pth
+*.pt
+*.ckpt
+*.tar
+
+# Large images
+*.tif
+*.tiff
+
+# Output
+runs/
+logs/
+checkpoints/
+output/
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+.vscode/

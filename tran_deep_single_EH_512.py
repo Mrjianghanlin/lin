@@ -1,0 +1,484 @@
+
+import argparse
+import logging
+import os
+import pprint
+
+import torch
+import numpy as np
+from torch import nn
+from torch.optim import SGD
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+import torch.nn.functional as F
+
+from dataset.mix_semi import SemiDataset
+from model.Hrnets.hrnet import HRnet
+from model.models.nets.deeplabv3_plus import DeepLab_mobilenet
+from model.models.nets1.mix_deeplab import DeepLab
+from model.models.nets1.deeplabv3_training import weights_init
+from model.semseg.deeplabv3plus import DeepLabV3Plus
+import albumentations as A
+from model.semseg.unet import UNet
+from util.classes import CLASSES
+from util.ohem import ProbOhemCrossEntropy2d
+from util.utils import count_params, AverageMeter, intersectionAndUnion, init_log
+
+
+parser = argparse.ArgumentParser(description='Revisiting Weak-to-Strong Consistency in Semi-Supervised Semantic Segmentation')
+# parser.add_argument('--labeled-id-path', type=str, default="../../../../../../home/lin/remote_sense/EH/VOCdevkit/VOC/sing_train/train.txt")
+# parser.add_argument('--val-id-path', type=str, default="../../../../../../home/lin/remote_sense/EH/VOCdevkit/VOC/sing_train/val.txt")
+
+parser.add_argument('--labeled-id-path', type=str, default="splits/cityscapes/my1_16/labeled.txt")
+parser.add_argument('--val-id-path', type=str, default="splits/cityscapes/my1_16/val.txt")
+# parser.add_argument('--unlabeled-id-path', type=str, default="splits/pascal/un_1_1/unlabeled.txt")
+parser.add_argument('--save-path', type=str, default="myEH/cityspces16")
+parser.add_argument('--local_rank', default=0, type=int)
+parser.add_argument('--port', default=None, type=int)
+parser.add_argument('--freeze-epochs', type=int, default=0)
+parser.add_argument('--use-swin', action='store_true', help='Enable Transformer branch')
+
+torch.cuda.set_device(1)
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+import torch
+
+# 自定义混合损失函数（交叉熵 + Dice Loss）
+class HybridLoss(nn.Module):
+    def __init__(self, ignore_index=255, alpha=0.5):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss(ignore_index=ignore_index)
+        self.alpha = alpha
+        self.eps = 1e-5
+
+    def forward(self, pred, target):
+        ce_loss = self.ce(pred, target)
+        
+        # Dice Loss计算
+        pred_softmax = F.softmax(pred, dim=1)
+        target_onehot = F.one_hot(target, num_classes=pred_softmax.shape[1]).permute(0, 3, 1, 2)
+        intersection = (pred_softmax * target_onehot).sum(dim=(2, 3))
+        union = pred_softmax.sum(dim=(2, 3)) + target_onehot.sum(dim=(2, 3))
+        dice_loss = 1 - (2 * intersection + self.eps) / (union + self.eps)
+        
+        return ce_loss + self.alpha * dice_loss.mean()
+
+def evaluate(model, loader, mode, cfg, print_stats=True):
+    model.eval()
+    assert mode in ['original', 'center_crop', 'sliding_window']
+
+    intersection_meter = AverageMeter()
+    union_meter = AverageMeter()
+
+    total = 0
+    correct = 0
+
+    # 统计：val GT 每类像素数、预测每类像素数
+    gt_pix = np.zeros(cfg['nclass'], dtype=np.int64)
+    pred_pix = np.zeros(cfg['nclass'], dtype=np.int64)
+
+    with torch.no_grad():
+        loader = tqdm(loader, desc="Evaluating")
+        for i, (img, mask, id) in enumerate(loader):
+            img = img.cuda(non_blocking=True)
+            mask_np = mask.numpy()  # [H,W] 或 [1,H,W]
+
+            if mode == 'sliding_window':
+                grid = cfg['crop_size']              # 512
+                stride = int(grid * 2 / 3)           # 341
+                b, _, h, w = img.shape
+
+                final = torch.zeros(b, cfg['nclass'], h, w, device=img.device)
+                count = torch.zeros(b, 1, h, w, device=img.device)
+
+                # 贴边滑窗：最后起点 = h-grid / w-grid，保证每块都是 512x512
+                rows = list(range(0, h - grid + 1, stride))
+                cols = list(range(0, w - grid + 1, stride))
+                if rows[-1] != h - grid:
+                    rows.append(h - grid)
+                if cols[-1] != w - grid:
+                    cols.append(w - grid)
+
+                for row in rows:
+                    for col in cols:
+                        patch = img[:, :, row:row + grid, col:col + grid]  # 永远 512x512
+                        pred_patch = model(patch).softmax(dim=1)
+                        final[:, :, row:row + grid, col:col + grid] += pred_patch
+                        count[:, :, row:row + grid, col:col + grid] += 1.0
+
+                final = final / (count + 1e-10)
+                pred = final.argmax(dim=1)  # [B,H,W]
+
+            else:
+                if mode == 'center_crop':
+                    h0, w0 = img.shape[-2:]
+                    start_h, start_w = (h0 - cfg['crop_size']) // 2, (w0 - cfg['crop_size']) // 2
+                    img = img[:, :, start_h:start_h + cfg['crop_size'], start_w:start_w + cfg['crop_size']]
+                    mask = mask[:, start_h:start_h + cfg['crop_size'], start_w:start_w + cfg['crop_size']]
+                    mask_np = mask.numpy()
+
+                pred = model(img).argmax(dim=1)
+
+            # --- IoU 统计 ---
+            intersection, union, target = intersectionAndUnion(
+                pred.cpu().numpy(), mask_np, cfg['nclass'], 255
+            )
+            intersection_meter.update(intersection)
+            union_meter.update(union)
+
+            # --- 像素准确率（注意：这里把 ignore=255 也算进去了，你也可以排除它） ---
+            total += pred.numel()
+            correct += (pred.cpu() == mask).sum().item()
+
+            # --- 统计每类像素数（GT & Pred） ---
+            # mask 可能是 [1,H,W]，先 squeeze
+            m = mask_np.squeeze()
+            p = pred.cpu().numpy().squeeze()
+
+            # 只统计 0~18，不统计 ignore=255
+            for k in range(cfg['nclass']):
+                gt_pix[k] += (m == k).sum()
+                pred_pix[k] += (p == k).sum()
+
+    acc = correct / total if total > 0 else 0.0
+    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10) * 100.0
+    mIoU = float(np.mean(iou_class))
+
+    print(f"Mean Accuracy: {acc:.4f}")
+
+    if print_stats:
+        print("\n[GT pixels per class] (val 中每类像素总量，0 表示val里几乎没有该类)")
+        for k in range(cfg['nclass']):
+            print(f"{k:02d} {CLASSES[cfg['dataset']][k]:>12s}: {gt_pix[k]}")
+
+        print("\n[Pred pixels per class] (模型预测为该类的像素总量，0 表示模型完全不预测该类)")
+        for k in range(cfg['nclass']):
+            print(f"{k:02d} {CLASSES[cfg['dataset']][k]:>12s}: {pred_pix[k]}")
+        print()
+
+    return mIoU, iou_class
+
+
+# 评估函数
+# def evaluate(model, loader, mode, cfg):
+#     model.eval()
+#     assert mode in ['original', 'center_crop', 'sliding_window']
+#     intersection_meter = AverageMeter()
+#     union_meter = AverageMeter()
+#     total=0
+#     correct=0
+#     best_acc = 0  # Initialize the best accuracy as 0
+#     with torch.no_grad():
+#         loader = tqdm(loader, desc="Evaluating")
+#         for i, (img, mask, id) in enumerate(loader):
+#             img = img.cuda()
+#             if mode == 'sliding_window':
+#                 grid = cfg['crop_size']  # 512
+#                 stride = int(grid * 2 / 3)  # 341
+#                 b, _, h, w = img.shape
+#
+#                 final = torch.zeros(b, cfg['nclass'], h, w, device=img.device)
+#                 count = torch.zeros(b, 1, h, w, device=img.device)
+#
+#                 # 保证最后一个窗贴边：最后起点 = h-grid / w-grid
+#                 rows = list(range(0, h - grid + 1, stride))
+#                 cols = list(range(0, w - grid + 1, stride))
+#                 if rows[-1] != h - grid:
+#                     rows.append(h - grid)
+#                 if cols[-1] != w - grid:
+#                     cols.append(w - grid)
+#
+#                 for row in rows:
+#                     for col in cols:
+#                         patch = img[:, :, row:row + grid, col:col + grid]  # 永远 512x512
+#                         pred_patch = model(patch).softmax(dim=1)
+#
+#                         final[:, :, row:row + grid, col:col + grid] += pred_patch
+#                         count[:, :, row:row + grid, col:col + grid] += 1.0
+#
+#                 final = final / (count + 1e-10)
+#                 pred = final.argmax(dim=1)
+#
+#             # if mode == 'sliding_window':
+#             #     grid = cfg['crop_size']
+#             #     b, _, h, w = img.shape
+#             #     final = torch.zeros(b, 19, h, w).cuda()
+#             #     row = 0
+#             #     while row < h:
+#             #         col = 0
+#             #         while col < w:
+#             #             pred = model(img[:, :, row: min(h, row + grid), col: min(w, col + grid)])
+#             #             final[:, :, row: min(h, row + grid), col: min(w, col + grid)] += pred.softmax(dim=1)
+#             #             col += int(grid * 2 / 3)
+#             #         row += int(grid * 2 / 3)
+#             #
+#             #     pred = final.argmax(dim=1)
+#
+#             else:
+#                 if mode == 'center_crop':
+#                     h, w = img.shape[-2:]
+#                     start_h, start_w = (h - cfg['crop_size']) // 2, (w - cfg['crop_size']) // 2
+#                     img = img[:, :, start_h:start_h + cfg['crop_size'], start_w:start_w + cfg['crop_size']]
+#                     mask = mask[:, start_h:start_h + cfg['crop_size'], start_w:start_w + cfg['crop_size']]
+#
+#                 pred = model(img).argmax(dim=1)
+#
+#             intersection, union, target = \
+#                 intersectionAndUnion(pred.cpu().numpy(), mask.numpy(), cfg['nclass'], 255)
+#
+#             intersection_meter.update(intersection)
+#             union_meter.update(union)
+#             total += img.size(0) * img.size(2) * img.size(3)
+#             correct += (pred == mask.cuda()).sum().item()
+#     if total == 0:
+#         acc = 0
+#     else:
+#         acc = correct / total
+#     if acc > best_acc:
+#         best_acc = acc
+#     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10) * 100.0
+#     mIoU = np.mean(iou_class)
+#
+#     print(f"Mean Accuracy: {acc:.4f}")
+#     print(f"Best Accuracy: {best_acc:.4f}")  # Print the best accuracy
+#     return mIoU, iou_class
+#
+#
+#
+
+
+# Remaining code for evaluation ...
+
+def main():
+    args = parser.parse_args()
+    # model_path = "./pretrained/best_epoch_weights.pth"
+    model_path = ""
+
+    cfg = {
+        'dataset': 'cityscapes',
+        'data_root': r'VOCdevkit',
+        'nclass': 19,
+        'crop_size': 512,
+        'pretrained': True,
+        'epochs': 200,
+        'batch_size': 4,
+        'lr': 0.001,
+        'lr_multi': 10.0,
+        'criterion': {'kwargs': {'ignore_index': 255,
+                                 'min_kept': 200000,
+                                 'thresh': 0.7},
+                      'name': 'OHEM'},
+        'conf_thresh': 0.95,
+        # 'backbone': 'resnet101_ibn_a',
+        # 'backbone': 'xception',
+        # 'backbone': 'mobilenet',
+        # 'backbone': 'hrnet',
+        'backbone': 'hrnet',
+        'replace_stride_with_dilation': [False, False, True],
+        'dilations': [6, 12, 18],
+        'model_path': "pretrained/hrnetv2_w48-imagenet.pth",
+        'num_workers': 1,
+        'downsample_factor': 16,
+        'in_channels': 3,
+        'use_swin':True,
+
+    }
+
+    logger = init_log('global', logging.INFO)
+    logger.propagate = 0
+
+    # Remove distributed training related code
+
+    all_args = {**cfg, **vars(args)}
+    logger.info('{}\n'.format(pprint.pformat(all_args)))
+
+    writer = SummaryWriter(args.save_path)
+
+    os.makedirs(args.save_path, exist_ok=True)
+
+
+
+    # model = HRnet(num_classes=cfg['nclass'], backbone=cfg['backbone'], pretrained=cfg['pretrained'])
+    # model = HRNet(in_channels=cfg['in_channels'], n_classes=cfg['nclass'], backbone=cfg['backbone'], pretrained=cfg['pretrained'])
+    # print(model)
+    # model=DeepLab_mobilenet( num_classes=cfg['nclass'], backbone=cfg['backbone'], pretrained=cfg['pretrained'],downsample_factor=cfg['downsample_factor'])
+    # model = DeepLabV3Plus(cfg)
+    # model = Unet(num_classes=cfg['nclass'], backbone=cfg['backbone'],pretrained=cfg['pretrained'])
+    # model = DeepLab(num_classes=cfg['nclass'], backbone=cfg['backbone'],pretrained=cfg['pretrained'])
+    model = DeepLab(num_classes=cfg['nclass'], backbone=cfg['backbone'], pretrained=cfg['pretrained'], downsample_factor=cfg['downsample_factor'],  use_swin=cfg['use_swin'])
+    # model = PSPNet(num_classes=cfg['nclass'], backbone=cfg['backbone'], pretrained=cfg['pretrained'], downsample_factor=cfg['downsample_factor'])
+
+
+    local_rank =0
+    if not cfg['pretrained']:
+        weights_init(model)
+
+    if model_path != '':
+        # ------------------------------------------------------#
+        #   权值文件请看README，百度网盘下载
+        # ------------------------------------------------------#
+        if local_rank == 0:
+            print('Load weights {}.'.format(model_path))
+
+        # ------------------------------------------------------#
+        #   根据预训练权重的Key和模型的Key进行加载
+        # ------------------------------------------------------#
+        model_dict = model.state_dict()
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        pretrained_dict = torch.load(model_path, map_location=device)
+        load_key, no_load_key, temp_dict = [], [], {}
+        for k, v in pretrained_dict.items():
+            if k in model_dict.keys() and np.shape(model_dict[k]) == np.shape(v):
+                temp_dict[k] = v
+                load_key.append(k)
+            else:
+                no_load_key.append(k)
+        model_dict.update(temp_dict)
+        model.load_state_dict(model_dict)
+        # ------------------------------------------------------#
+        #   显示没有匹配上的Key
+        # ------------------------------------------------------#
+        if local_rank == 0:
+            print("\nSuccessful Load Key:", str(load_key)[:500], "……\nSuccessful Load Key Num:", len(load_key))
+            print("\nFail To Load Key:", str(no_load_key)[:500], "……\nFail To Load Key num:", len(no_load_key))
+            print("\n\033[1;33;44m温馨提示，head部分没有载入是正常现象，Backbone部分没有载入是错误的。\033[0m")
+
+    # ----------------------#
+
+
+      # 分层优化器设置 (Transformer分支学习率更高)
+    params_to_optimize = [
+        {'params': model.backbone.parameters(), 'lr': cfg['lr'] * 0.1},
+        {'params': model.aspp.parameters(), 'lr': cfg['lr']},
+        {'params': model.shortcut_conv.parameters(), 'lr': cfg['lr']},
+        {'params': model.cat_conv.parameters(), 'lr': cfg['lr']},
+        {'params': model.cls_conv.parameters(), 'lr': cfg['lr']}
+    ]
+    
+    if args.use_swin:
+        params_to_optimize.extend([
+            {'params': model.trans_branch.parameters(), 'lr': cfg['lr'] * 2},
+            {'params': model.cafm.parameters(), 'lr': cfg['lr']}
+        ])
+
+    logger.info('Total params: {:.1f}M\n'.format(count_params(model)))
+
+    optimizer = SGD(params_to_optimize, lr=cfg['lr'], momentum=0.9, weight_decay=1e-4)
+
+    model = model.cuda()
+
+    if cfg['criterion']['name'] == 'CELoss':
+        criterion = nn.CrossEntropyLoss(**cfg['criterion']['kwargs']).cuda()
+    elif cfg['criterion']['name'] == 'OHEM':
+        criterion = ProbOhemCrossEntropy2d(**cfg['criterion']['kwargs']).cuda()
+    elif cfg['criterion']['name'] == 'HybridLoss':
+        criterion = HybridLoss(**cfg['criterion']['kwargs']).cuda()
+    else:
+        raise NotImplementedError('%s criterion is not implemented' % cfg['criterion']['name'])
+
+    
+    
+    trainset = SemiDataset(cfg['dataset'], cfg['data_root'], 'train_l', cfg['crop_size'], args.labeled_id_path)
+    valset = SemiDataset(cfg['dataset'], cfg['data_root'], 'val',cfg['crop_size'],args.val_id_path)
+
+    trainloader = DataLoader(trainset, batch_size=cfg['batch_size'], pin_memory=True, num_workers=cfg['num_workers'], drop_last=True)
+    valloader = DataLoader(valset, batch_size=1, pin_memory=True, num_workers=cfg['num_workers'], drop_last=False)
+
+
+    iters = 0
+    total_iters = len(trainloader) * cfg['epochs']
+    previous_best = 0.0
+    epoch = -1
+
+    if os.path.exists(os.path.join(args.save_path, 'latest.pth')):
+        checkpoint_path = os.path.join(args.save_path, 'latest.pth')
+        checkpoint = torch.load(checkpoint_path)
+        model.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        epoch = checkpoint['epoch']
+        previous_best = checkpoint['previous_best']
+
+        logger.info('************ Load from checkpoint at epoch %i\n' % epoch)
+
+    for epoch in range(epoch + 1, cfg['epochs']):
+        logger.info('===========> Epoch: {:}, LR: {:.5f}, Previous best: {:.2f}'.format(
+            epoch, optimizer.param_groups[0]['lr'], previous_best))
+        if epoch < args.freeze_epochs:
+            for name, param in model.backbone.named_parameters():
+                if 'layer1' in name or 'layer2' in name or 'layer3' in name or 'layer4' in name:
+                # if 'layer1' in name or 'layer2' in name or 'layer3' in name :
+                # if 'layer1' in name or 'layer2' in name:
+                # if 'layer1' in name  :
+                    param.requires_grad = False
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    print(f'Frozen parameter: {name}')
+        else:
+            for param in model.backbone.parameters():
+                param.requires_grad = True
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    print(f'Frozen parameter: {name}')
+
+        model.train()
+        total_loss = AverageMeter()
+
+        for i, (img, mask) in enumerate(trainloader):
+
+            img, mask = img.cuda(), mask.cuda()
+
+            pred = model(img)
+
+            loss = criterion(pred, mask)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss.update(loss.item())
+
+            iters = epoch * len(trainloader) + i
+            lr = cfg['lr'] * (1 - iters / total_iters) ** 0.9
+            optimizer.param_groups[0]["lr"] = lr
+
+            writer.add_scalar('train/loss_all', loss.item(), iters)
+            writer.add_scalar('train/loss_x', loss.item(), iters)
+
+            if i % (max(2, len(trainloader) // 8)) == 0:
+                logger.info('Iters: {:}, Total loss: {:.3f}'.format(i, total_loss.avg))
+
+        eval_mode = 'sliding_window' if cfg['dataset'] == 'cityscapes' else 'original'
+        mIoU, iou_class = evaluate(model, valloader, eval_mode, cfg)
+
+        for (cls_idx, iou) in enumerate(iou_class):
+            logger.info('***** Evaluation ***** >>>> Class [{:} {:}] IoU: {:.2f}'.format(
+                cls_idx, CLASSES[cfg['dataset']][cls_idx], iou))
+        logger.info('***** Evaluation {} ***** >>>> MeanIoU: {:.2f}\n'.format(eval_mode, mIoU))
+
+        writer.add_scalar('eval/mIoU', mIoU, epoch)
+        for i, iou in enumerate(iou_class):
+            writer.add_scalar('eval/%s_IoU' % (CLASSES[cfg['dataset']][i]), iou, epoch)
+
+        is_best = mIoU > previous_best
+        previous_best = max(mIoU, previous_best)
+
+        checkpoint = {
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            
+            'epoch': epoch,
+            'previous_best': previous_best,
+            
+        }
+        # torch.save(model.state_dict(), os.path.join(args.save_path, f"model_epoch_{epoch}_{total_loss.val:.4f}.pth"))
+
+        torch.save(checkpoint, os.path.join(args.save_path, 'latest.pth'))
+        if is_best:
+            torch.save(model.state_dict(), os.path.join(args.save_path, "best_epoch_weights.pth"))
+            # torch.save(checkpoint, os.path.join(args.save_path, 'best.pth'))
+            best_checkpoint_filename = os.path.join(args.save_path, f"best_epoch_weights_val_mIoU_{mIoU:.4f}.pth")
+            torch.save(model.state_dict(), best_checkpoint_filename)
+
+
+if __name__ == '__main__':
+    main()
